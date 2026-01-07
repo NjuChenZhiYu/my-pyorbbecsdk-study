@@ -36,6 +36,13 @@ def main():
     except Exception as e:
         print(e)
         return
+    # 在 pipeline.start() 之前添加
+    device = pipeline.get_device()
+    device_info = device.get_device_info()
+    print(f"Device Name: {device_info.get_name()}")
+    print(f"Serial Number: {device_info.get_serial_number()}")
+    print(f"Firmware Version: {device_info.get_firmware_version()}")
+
     pipeline.start(config)
     while True:
         try:
@@ -61,4 +68,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
