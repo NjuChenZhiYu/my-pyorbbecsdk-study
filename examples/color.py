@@ -16,9 +16,46 @@
 import cv2
 
 from pyorbbecsdk import *
+# 必须导入属性枚举
+from pyorbbecsdk import Pipeline, Config, OBSensorType, OBPropertyID, OBError
+from pyorbbecsdk import OBPropertyID
 from utils import frame_to_bgr_image
+import time
 
 ESC_KEY = 27
+
+def auto_configure_camera():
+    pipeline = Pipeline()
+    device = pipeline.get_device()
+
+    # 1. 获取并校验固件版本
+    info = device.get_device_info()
+    fw_version = info.get_firmware_version()
+    print(f"检测到设备: {info.get_name()}, 固件版本: {fw_version}")
+
+    # 针对你截图中的 1.6.21 版本进行逻辑判断
+    target_fw = "1.6.21"
+    if fw_version == target_fw:
+        print(f"--- 固件版本匹配 ({target_fw})，开始执行自动配置 ---")
+
+        try:
+            # 2. 确保 LDP (激光保护) 处于开启状态以保证安全
+            # 虽然你之前查到是 False，但在正式实验前建议设为 True
+            print(device.get_bool_property(OBPropertyID.OB_PROP_LDP_BOOL))
+            device.set_bool_property(OBPropertyID.OB_PROP_LDP_BOOL, True)
+            print("已激活 LDP 激光保护机制")
+            # 3. 开启激光投射器 (Laser Control)
+            # 这对 335Lg 获取高质量深度图至关重要
+            device.set_bool_property(OBPropertyID.OB_PROP_LASER_CONTROL_INT, True)
+            print("激光投射器已开启，正在准备 3D 数据流...")
+
+            # 4. 这里的延时是为了让激光功率稳定
+            time.sleep(1)
+
+        except OBError as e:
+            print(f"配置属性时发生错误: {e}")
+    else:
+        print(f"警告: 固件版本为 {fw_version}，非预期的 {target_fw}，跳过自动配置。")
 
 
 def main():
@@ -42,7 +79,7 @@ def main():
     print(f"Device Name: {device_info.get_name()}")
     print(f"Serial Number: {device_info.get_serial_number()}")
     print(f"Firmware Version: {device_info.get_firmware_version()}")
-
+    auto_configure_camera()
     pipeline.start(config)
     while True:
         try:

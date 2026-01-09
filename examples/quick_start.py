@@ -32,7 +32,7 @@ def main():
     print("Pipeline started successfully. Press 'q' or ESC to exit.")
 
     # Set window size
-    window_width = 1280
+    window_width = 1080
     window_height = 720
     cv2.namedWindow("QuickStart Viewer", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("QuickStart Viewer", window_width, window_height)
