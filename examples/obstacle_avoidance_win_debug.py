@@ -1,109 +1,96 @@
+# -*- coding: utf-8 -*-
 import cv2
 import numpy as np
-from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat
+from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode
 
 
 def main():
     pipeline = Pipeline()
     config = Config()
 
-    # 1. 启用深度流（避障的核心是深度数据）
+    # 1. 开启硬件对齐 (D2C)，确保彩色和深度图坐标一致
+    config.set_align_mode(OBAlignMode.HW_MODE)
+
+    WIDTH, HEIGHT, FPS = 640, 480, 30
     try:
-        profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-        # 获取默认深度流配置，通常是 640x480 或 1280x720，30fps
-        profile = profile_list.get_default_video_stream_profile()
-        config.enable_stream(profile)
+        # 配置双流
+        color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+        color_p = color_profiles.get_video_stream_profile(WIDTH, HEIGHT, OBFormat.MJPG, FPS)
+        config.enable_stream(color_p)
+
+        depth_profiles = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+        depth_p = depth_profiles.get_video_stream_profile(WIDTH, HEIGHT, OBFormat.Y16, FPS)
+        config.enable_stream(depth_p)
     except Exception as e:
-        print(f"ERROR: 无法开启深度流: {e}")
+        print(f"流开启失败: {e}")
         return
 
     pipeline.start(config)
 
-    # 定义避障参数（这些参数是你可以调整来测试不同场景的关键）
-    MIN_DISTANCE_MM = 0  # 最小安全距离 (10cm)
-    MAX_DISTANCE_MM = 350  # 最大检测距离 (80cm)
+    # --- 核心参数调整 ---
+    SAFE_DISTANCE_MM = 400  # 安全边界设为 40cm
+    MIN_NOISE_DIST = 50  # 过滤掉 5cm 以内的镜头噪点
+    # 触发阈值：如果区域内超过 3% 的像素点低于 40cm，则判定为碰撞
+    DANGER_PIXEL_RATIO = 0.03
 
-    # 避障检测区域 (ROI): 画面中心区域的宽度和高度
-    ROI_WIDTH_PERCENT = 0.5  # 区域宽度占画面宽度的 50%
-    ROI_HEIGHT_PERCENT = 0.4  # 区域高度占画面高度的 40%
-
-    # 触发避障的危险像素点占比阈值
-    DANGER_PIXEL_THRESHOLD_PERCENT = 0.03  # 如果危险像素超过 3% 就报警
-
-    print("\n--- Orbbec 3D 避障预警服务已启动 ---")
-    print(f"检测距离范围: {MIN_DISTANCE_MM}mm - {MAX_DISTANCE_MM}mm")
-    print(f"危险像素占比阈值: {DANGER_PIXEL_THRESHOLD_PERCENT * 100:.1f}%")
-    print("请将手或物体放到相机前，观察画面变化。按 'q' 退出。")
+    print(f"\n--- 避障参数已更新 ---")
+    print(f"当前安全距离阈值: {SAFE_DISTANCE_MM} mm (40cm)")
+    print("低于 40cm: 红色警告 | 高于 40cm: 绿色安全")
 
     try:
         while True:
-            frames = pipeline.wait_for_frames(100)  # 等待 100ms
-            if not frames:
-                continue
+            frames = pipeline.wait_for_frames(100)
+            if not frames: continue
 
+            color_frame = frames.get_color_frame()
             depth_frame = frames.get_depth_frame()
-            if not depth_frame:
-                continue
+            if color_frame is None or depth_frame is None: continue
 
-            width, height = depth_frame.get_width(), depth_frame.get_height()
-            # 1. 获取原始数据
-            raw_data = depth_frame.get_data()
-            # 2. 将数据转换为一维 numpy 数组
-            depth_data_1d = np.frombuffer(raw_data, dtype=np.uint16)
-            # 3. 核心修正：根据相机的宽高，将 1D 数组重塑为 2D 矩阵
-            # 注意：Gemini 335Lg 的深度通常是 uint16 类型
-            depth_data = depth_data_1d.reshape((height, width))
+            # 处理彩色图
+            raw_color = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
+            color_img = cv2.imdecode(raw_color, cv2.IMREAD_COLOR)
 
-            # 计算动态 ROI 区域的实际像素坐标
-            roi_pixel_w = int(width * ROI_WIDTH_PERCENT)
-            roi_pixel_h = int(height * ROI_HEIGHT_PERCENT)
+            # 处理深度图
+            w, h = depth_frame.get_width(), depth_frame.get_height()
+            depth_raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
+            depth_data = depth_raw.reshape((h, w))
 
-            x1 = (width - roi_pixel_w) // 2
-            y1 = (height - roi_pixel_h) // 2
-            x2 = x1 + roi_pixel_w
-            y2 = y1 + roi_pixel_h
+            # 定义中心探测区域 (ROI)
+            roi_w, roi_h = int(w * 0.4), int(h * 0.4)
+            x1, y1 = (w - roi_w) // 2, (h - roi_h) // 2
+            roi_depth = depth_data[y1:y1 + roi_h, x1:x1 + roi_w]
 
-            # 提取 ROI 区域的深度数据
-            # 4. 现在你可以安全地进行二维切片了
-            roi_depth_data = depth_data[y1:y2, x1:x2]
+            # 碰撞判定逻辑
+            # 统计在 [50mm, 400mm] 范围内的危险像素点
+            danger_mask = (roi_depth > MIN_NOISE_DIST) & (roi_depth < SAFE_DISTANCE_MM)
+            danger_count = np.sum(danger_mask)
+            danger_ratio = danger_count / (roi_w * roi_h)
 
-            # 统计 ROI 区域内，处于危险距离范围的像素点
-            # 排除 0 值（无效深度）和太远的背景
-            danger_mask = (roi_depth_data > MIN_DISTANCE_MM) & (roi_depth_data < MAX_DISTANCE_MM)
-            danger_pixel_count = np.sum(danger_mask)
+            # 低于 40cm 判定为 Collision
+            is_collision = danger_ratio > DANGER_PIXEL_RATIO
 
-            # 计算危险像素点占整个 ROI 区域的比例
-            total_roi_pixels = roi_pixel_w * roi_pixel_h
-            if total_roi_pixels == 0:  # 避免除以零
-                collision_risk_ratio = 0
-            else:
-                collision_risk_ratio = danger_pixel_count / total_roi_pixels
+            # 渲染深度伪彩色图
+            depth_visual = cv2.normalize(depth_data, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+            depth_visual = cv2.applyColorMap(depth_visual, cv2.COLORMAP_JET)
 
-            # 决策逻辑：根据危险像素占比判断是否触发报警
-            is_collision = collision_risk_ratio >= DANGER_PIXEL_THRESHOLD_PERCENT
+            # UI 反馈
+            box_color = (0, 0, 255) if is_collision else (0, 255, 0)
+            status_text = "COLLISION!" if is_collision else "SAFE"
 
-            # 5. 可视化 UI 反馈
-            # 归一化深度图以便显示（0-255，伪彩色）
-            # 注意：这里对深度数据进行了 clip 和 normalize，以增强显示效果，不影响原始避障计算
-            display_img = cv2.normalize(depth_data, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-            display_img = cv2.applyColorMap(display_img, cv2.COLORMAP_JET)
+            # 在彩色图上绘制
+            cv2.rectangle(color_img, (x1, y1), (x1 + roi_w, y1 + roi_h), box_color, 3)
+            cv2.putText(color_img, f"STATUS: {status_text}", (20, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, box_color, 3)
+            cv2.putText(color_img, f"Dist < 40cm: {danger_ratio * 100:.1f}%", (20, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
 
-            # 绘制避障检测框，根据状态改变颜色
-            box_color = (0, 0, 255) if is_collision else (0, 255, 0)  # 红色警告，绿色安全
-            cv2.rectangle(display_img, (x1, y1), (x2, y2), box_color, 3)
+            # 左右拼接并显示
+            combined_view = cv2.hconcat([color_img, depth_visual])
+            cv2.imshow("40cm Collision Detection Debug", combined_view)
 
-            # 绘制预警文字
-            msg = "!!! COLLISION AHEAD !!!" if is_collision else "Path Clear"
-            cv2.putText(display_img, msg, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, box_color, 2, cv2.LINE_AA)
-            cv2.putText(display_img, f"Danger Pixels: {collision_risk_ratio * 100:.1f}%", (x1, y2 + 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2, cv2.LINE_AA)
-
-            cv2.imshow("Orbbec 3D Obstacle Avoidance Service (Windows Debug)", display_img)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
     finally:
-        pipeline.stop()  # 确保停止相机，释放资源
+        pipeline.stop()
 
 
 if __name__ == "__main__":
